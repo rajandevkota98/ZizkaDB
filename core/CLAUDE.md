@@ -13,7 +13,7 @@ The thirteen routers mounted in `main.py` (`app.include_router`):
 | File | Prefix | Auth type |
 |---|---|---|
 | `api/auth.py` | `/v1/auth` | mixed (public OTP + JWT-only key mgmt) |
-| `api/events.py` | `/v1/events` | `get_tenant` (+ `assert_agent_allowed` on `/why`, `/at`) |
+| `api/events.py` | `/v1/events` | `get_tenant` (+ `assert_agent_allowed` on `/why`, `/impact`, `/at`, `/verify`, `/{id}/verify`) |
 | `api/agents.py` | `/v1/agents` | mixed (see below) |
 | `api/a2a.py` | `/v1/a2a` | `get_tenant` |
 | `api/search.py` | `/v1/search` | `get_tenant` + `assert_agent_allowed` |
@@ -34,6 +34,8 @@ Under `/v1/agents`: per-agent analytics (`/stats`, `/sessions`, `/baseline`, `/b
 Swagger UI: `http://localhost:8000/swagger` · OpenAPI schema: `/openapi.json`
 
 ### A2A (`POST /v1/a2a/messages`)
+
+**Managed cloud only**: on `DEPLOYMENT_MODE=self_hosted` the route returns 403 (self-hosted is single-agent, see `services/agent_limits.py`).
 
 SDK-only. Auth is `get_tenant`, but a **tenant-wide key or JWT without `agent_id` is 403** — the sender is never a request field.
 
@@ -60,9 +62,10 @@ Is this route dashboard-only (manages keys, billing, user settings, destructive 
 
 Is this route per-agent analytics OR an SDK read scoped to one agent
 (stats, sessions, baseline, behavior-change, time-travel, report, token-usage,
-token-optimization, suggestions, memory/context, memory/diff, events/why)?
+token-optimization, suggestions, memory/context, memory/diff, events/why, events/impact,
+events/verify, events/{id}/verify)?
   → Depends(get_tenant)  AND  assert_agent_allowed(tenant, agent_id)  at the top of the handler
-    (for memory/diff & events/why the agent is resolved from the row, then asserted;
+    (for memory/diff, events/why, events/impact & events/{id}/verify the agent is resolved from the row, then asserted;
      memory/forget constrains its delete to the scoped agent when the key is scoped)
 
 Could an API key with no agent yet (is_unbound_api_key) reach tenant-wide data here?
@@ -99,7 +102,7 @@ Never use SQLAlchemy, never open a direct `asyncpg.connect()` — always use the
 ## Shared utilities
 
 `api/utils.py` — use these, never reimplement:
-- `client_ip(request)` — extracts real client IP from `X-Forwarded-For` or `request.client`
+- `client_ip(request)` — client IP for rate limiting: walks `X-Forwarded-For` right-to-left past `TRUSTED_PROXIES` hops; falls back to `request.client`
 - `check_rate(key, store, limit, window_seconds)` — in-process rate limiter; `store` is a module-level dict
 
 ---
@@ -115,12 +118,14 @@ Never use SQLAlchemy, never open a direct `asyncpg.connect()` — always use the
 | `services/embeddings.py` | OpenAI embedding generation + Redis cache (24 h TTL) |
 | `services/embedding_config.py` | Per-tenant embedding model config (`QDRANT_COLLECTION`, `VECTOR_SIZE`) |
 | `services/event_write.py` | Core event ingestion: Postgres insert + Qdrant upsert (non-fatal if Qdrant fails) |
+| `services/checksum.py` | Event checksum v2 (all audit fields) + legacy v1, and `verify_stored_checksum()`; the write path hashes Postgres-canonicalised values so writer and verifier hash identical inputs; v1 only accepted up to `checksum_v2_cutoff` |
 | `services/account.py` | Trial activation, GDPR consent, account deletion |
 | `services/pricing.py` | Hardcoded per-model $/1K token pricing (`MODEL_PRICING`) + `cost_for()` — see ADR-006 |
 | `services/token_usage.py` | Per-agent token/cost aggregation from `events.data.token_usage` — see ADR-006 |
 | `services/token_optimization_config.py` | Tunable thresholds for the deterministic Token Optimization detectors |
 | `services/token_optimization_models.py` | `TokenOptimizationSuggestion`/`Aggregates`/`Result` dataclasses (unrelated to `services/suggestions/`'s types) |
 | `services/token_optimization.py` | 5 deterministic (no-LLM) detectors + orchestrator — see ADR-007 |
+| `services/actions.py` | Which tool / API an event names (`data.tool`, `data.api`) + per-action call counts and error rates; the only place those payload keys are read in SQL |
 
 ---
 
@@ -140,7 +145,7 @@ Never use SQLAlchemy, never open a direct `asyncpg.connect()` — always use the
 2. Runs `ALTER TABLE` migrations idempotently
 3. Creates community/SDK/marketing tables if missing
 4. Backfills `users.plan = 'pro'` for users with `plan IS NULL`
-5. Seeds a dev tenant (and logs a `DEV MODE` warning) only when `ENV` is `development` or unset — same gate as dev-key acceptance (`api.deps.dev_keys_enabled()`)
+5. Seeds a dev tenant (and logs a `DEV MODE` warning) only when `ENV=development` — same gate as dev-key acceptance (`api.deps.dev_keys_enabled()`). An unset `ENV` is production (`services/runtime_env.py::is_dev_mode`)
 
 ---
 

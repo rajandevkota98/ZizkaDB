@@ -5,20 +5,14 @@ from typing import Any
 from uuid import UUID
 from datetime import datetime
 import json
-import os
 
-from api.deps import get_tenant, assert_agent_allowed
+from api.deps import get_tenant, assert_agent_allowed, is_unbound_api_key
 from db.connection import get_pool
+from services.checksum import CHECKSUM_COLUMNS, fetch_legacy_cutoff, verify_stored_checksum
 from services.event_write import write_event
 from services.why_analysis import analyze_why_chain
 
 router = APIRouter()
-
-_EVENTS_AT_MAX_ROWS = int(os.getenv("EVENTS_AT_MAX_ROWS", "10000"))
-
-
-def _events_at_max_rows() -> int:
-    return max(1, min(_EVENTS_AT_MAX_ROWS, 100_000))
 
 
 # ─────────────────────────────────────────
@@ -216,9 +210,165 @@ async def why(
 
 
 # ─────────────────────────────────────────
+# IMPACT — GET /v1/events/{event_id}/impact
+# Walk the causal graph downstream: what did this event cause?
+# ─────────────────────────────────────────
+
+# Depth bounds how far the walk goes, not how wide: one event can have any
+# number of children. Cap the nodes returned and say when the cap was hit.
+IMPACT_MAX_NODES = 500
+
+
+@router.get("/{event_id}/impact")
+async def impact(
+    event_id: str,
+    depth: int = Query(default=10, ge=0, le=50),
+    tenant: dict = Depends(get_tenant),
+):
+    pool = get_pool()
+    tenant_id = tenant["tenant_id"]
+
+    try:
+        UUID(event_id)
+    except ValueError:
+        raise not_found("Event not found")
+
+    # Authorize on the anchor before walking, so the walk itself is always
+    # scoped: a scoped key only anchors on its own agent's events (else 404),
+    # and an unbound key is bound to the anchor's agent here.
+    anchor_agent = await pool.fetchval(
+        """
+        SELECT agent_id FROM events
+        WHERE event_id = $1 AND tenant_id = $2
+          AND ($3::text IS NULL OR agent_id = $3)
+        """,
+        event_id, tenant_id, tenant.get("agent_id"),
+    )
+    if anchor_agent is None:
+        raise not_found("Event not found")
+    await assert_agent_allowed(tenant, anchor_agent)
+    scoped_agent = tenant.get("agent_id")
+
+    # No ORDER BY around the CTE: Postgres then evaluates the recursion only
+    # as far as the LIMIT fetches, and it emits rows level by level, so the
+    # cap keeps the shallowest nodes. Within the cut level the choice is
+    # arbitrary; the response is sorted below.
+    rows = await pool.fetch(
+        """
+        WITH RECURSIVE impact_tree AS (
+            SELECT
+                event_id, agent_id, timestamp, event_type,
+                data, parent_event_id, session_id, sequence_no, metadata,
+                0 AS depth
+            FROM events
+            WHERE event_id = $1 AND tenant_id = $2
+
+            UNION ALL
+
+            SELECT
+                e.event_id, e.agent_id, e.timestamp, e.event_type,
+                e.data, e.parent_event_id, e.session_id, e.sequence_no, e.metadata,
+                it.depth + 1
+            FROM events e
+            INNER JOIN impact_tree it ON e.parent_event_id = it.event_id
+            WHERE e.tenant_id = $2 AND it.depth < $3
+              AND ($4::text IS NULL OR e.agent_id = $4)
+        )
+        SELECT * FROM impact_tree
+        LIMIT $5
+        """,
+        event_id, tenant_id, depth, scoped_agent, IMPACT_MAX_NODES + 1,
+    )
+
+    truncated = len(rows) > IMPACT_MAX_NODES
+    rows = sorted(rows[:IMPACT_MAX_NODES], key=lambda r: (r["depth"], r["sequence_no"]))
+
+    # Does the walk stop at the depth limit while events lie beyond it?
+    depth_truncated = False
+    if not truncated:
+        frontier = [r["event_id"] for r in rows if r["depth"] == depth]
+        if frontier:
+            depth_truncated = await pool.fetchval(
+                """
+                SELECT EXISTS (
+                    SELECT 1 FROM events
+                    WHERE tenant_id = $1 AND parent_event_id = ANY($2::uuid[])
+                      AND ($3::text IS NULL OR agent_id = $3)
+                )
+                """,
+                tenant_id, frontier, scoped_agent,
+            )
+
+    return {
+        "event_id": event_id,
+        "node_count": len(rows),
+        "truncated": truncated,
+        "depth_truncated": depth_truncated,
+        "nodes": [{**_format_event(r), "depth": r["depth"]} for r in rows],
+    }
+
+
+# ─────────────────────────────────────────
 # TIME TRAVEL — GET /v1/events/at
 # Reconstruct agent state at a given time
 # ─────────────────────────────────────────
+
+# The state at T is, per key, the newest write to that key at or before T: a
+# STATE_SET carrying the key, a STATE_DELETE naming it (the key is then absent),
+# or, for "_last_event", the newest event of any other type. Postgres picks the
+# winner per key in one pass over the agent's state events, so the answer is exact
+# for any history length and one row per surviving key leaves the database.
+# Ties on timestamp go to sequence_no.
+_STATE_AT_SQL = """
+    WITH state_writes AS (
+        SELECT w.key, w.value_json, NULL::uuid AS event_id, s.timestamp, s.sequence_no
+        FROM events s
+        CROSS JOIN LATERAL (
+            SELECT kv.key, kv.value::text AS value_json
+            FROM jsonb_each(
+                CASE WHEN s.event_type = 'STATE_SET' AND jsonb_typeof(s.data) = 'object'
+                     THEN s.data ELSE '{}'::jsonb END
+            ) AS kv
+
+            UNION ALL
+
+            -- The key dict.pop(data.get("key", "")) would remove: the named key
+            -- when it is a string, "" when the field is missing, nothing otherwise.
+            -- A NULL value marks the key as deleted.
+            SELECT COALESCE(s.data->>'key', ''), NULL
+            WHERE s.event_type = 'STATE_DELETE'
+              AND jsonb_typeof(s.data) = 'object'
+              AND (NOT (s.data ? 'key') OR jsonb_typeof(s.data->'key') = 'string')
+        ) AS w
+        WHERE s.tenant_id = $1
+          AND s.agent_id = $2
+          AND s.timestamp <= $3
+          AND s.event_type IN ('STATE_SET', 'STATE_DELETE')
+    ),
+    last_event AS (
+        SELECT '_last_event'::text AS key, NULL::text AS value_json, event_id,
+               timestamp, sequence_no
+        FROM events
+        WHERE tenant_id = $1
+          AND agent_id = $2
+          AND timestamp <= $3
+          AND event_type NOT IN ('STATE_SET', 'STATE_DELETE')
+        ORDER BY timestamp DESC, sequence_no DESC
+        LIMIT 1
+    ),
+    latest AS (
+        SELECT DISTINCT ON (key) key, value_json, event_id
+        FROM (SELECT * FROM state_writes UNION ALL SELECT * FROM last_event) AS w
+        ORDER BY key, timestamp DESC, sequence_no DESC
+    )
+    SELECT l.key, l.value_json, e.event_id, e.event_type, e.timestamp,
+           e.data::text AS event_json
+    FROM latest l
+    LEFT JOIN events e ON e.event_id = l.event_id
+    WHERE l.value_json IS NOT NULL OR l.event_id IS NOT NULL
+    ORDER BY l.key
+"""
+
 
 @router.get("/at")
 async def time_travel(
@@ -229,50 +379,155 @@ async def time_travel(
     await assert_agent_allowed(tenant, agent)
     pool = get_pool()
     tenant_id = tenant["tenant_id"]
-    max_rows = _events_at_max_rows()
 
-    rows = await pool.fetch(
-        """
-        SELECT event_id, agent_id, timestamp, event_type,
-               data, parent_event_id, session_id, sequence_no, metadata
-        FROM events
-        WHERE tenant_id = $1
-          AND agent_id = $2
-          AND timestamp <= $3
-        ORDER BY timestamp ASC
-        LIMIT $4
-        """,
-        tenant_id, agent, timestamp, max_rows + 1,
-    )
+    # One snapshot for both reads, so event_count and state describe the same history.
+    async with pool.acquire() as conn:
+        async with conn.transaction(isolation="repeatable_read", readonly=True):
+            event_count = await conn.fetchval(
+                """
+                SELECT COUNT(*) FROM events
+                WHERE tenant_id = $1 AND agent_id = $2 AND timestamp <= $3
+                """,
+                tenant_id, agent, timestamp,
+            )
+            rows = await conn.fetch(_STATE_AT_SQL, tenant_id, agent, timestamp)
 
-    truncated = len(rows) > max_rows
-    if truncated:
-        rows = rows[:max_rows]
-
-    # Reduce events to state (event sourcing pattern)
     state: dict[str, Any] = {}
     for row in rows:
-        data = json.loads(row["data"]) if isinstance(row["data"], str) else dict(row["data"])
-        if row["event_type"] == "STATE_SET":
-            state.update(data)
-        elif row["event_type"] == "STATE_DELETE":
-            state.pop(data.get("key", ""), None)
+        if row["event_id"] is None:
+            state[row["key"]] = json.loads(row["value_json"])
         else:
             state["_last_event"] = {
                 "event_id": str(row["event_id"]),
                 "type": row["event_type"],
                 "timestamp": row["timestamp"].isoformat(),
-                "data": data,
+                "data": json.loads(row["event_json"]),
             }
 
     return {
         "agent": agent,
         "at": timestamp.isoformat(),
-        "event_count": len(rows),
-        "truncated": truncated,
-        "max_rows": max_rows,
+        "event_count": event_count,
+        # Kept for clients that read it; the state above is never cut short.
+        "truncated": False,
         "state": state,
     }
+
+
+# ─────────────────────────────────────────
+# VERIFY CHECKSUMS — GET /v1/events/verify
+# Recompute checksums for an agent's events (audit helper)
+# ─────────────────────────────────────────
+
+@router.get("/verify")
+async def verify_events(
+    agent: str,
+    limit: int = Query(default=100, ge=1, le=1000),
+    before: datetime | None = None,
+    after: datetime | None = None,
+    before_seq: int | None = Query(default=None, ge=1),
+    tenant: dict = Depends(get_tenant),
+):
+    """Recompute each event's checksum and compare with the stored value.
+
+    Statuses: ``valid`` (v2, all audit fields), ``valid_legacy`` (v1, payload
+    only, rows written before v2), ``mismatch`` (tampering or corruption),
+    ``missing``. Results are newest first (by ``sequence_no``); fetch the next
+    page by passing ``next_before_seq`` as ``before_seq`` until it is null.
+    ``before`` / ``after`` optionally bound the window by timestamp.
+    """
+    await assert_agent_allowed(tenant, agent)
+    if before and after and after >= before:
+        raise bad_request("'after' must be earlier than 'before'")
+
+    pool = get_pool()
+    conditions = ["tenant_id = $1", "agent_id = $2"]
+    params: list[Any] = [tenant["tenant_id"], agent]
+
+    if before:
+        params.append(before)
+        conditions.append(f"timestamp < ${len(params)}")
+    if after:
+        params.append(after)
+        conditions.append(f"timestamp > ${len(params)}")
+    # sequence_no is unique, so paging on it never skips rows that share a
+    # timestamp with the last row of the previous page.
+    if before_seq:
+        params.append(before_seq)
+        conditions.append(f"sequence_no < ${len(params)}")
+    params.append(limit)
+
+    rows = await pool.fetch(
+        f"""
+        SELECT {CHECKSUM_COLUMNS}
+        FROM events
+        WHERE {" AND ".join(conditions)}
+        ORDER BY sequence_no DESC
+        LIMIT ${len(params)}
+        """,
+        *params,
+    )
+    legacy_until_seq = await fetch_legacy_cutoff(pool)
+
+    summary = {"checked": len(rows), "valid": 0, "valid_legacy": 0, "mismatch": 0, "missing": 0}
+    mismatches = []
+    for r in rows:
+        result = verify_stored_checksum(r, legacy_until_seq)
+        summary[result["status"]] += 1
+        if result["status"] == "mismatch":
+            mismatches.append({
+                "event_id": str(r["event_id"]),
+                "sequence_no": r["sequence_no"],
+                "timestamp": r["timestamp"].isoformat(),
+                **result,
+            })
+
+    return {
+        "agent": agent,
+        "summary": summary,
+        "mismatches": mismatches,
+        "next_before_seq": rows[-1]["sequence_no"] if len(rows) == limit else None,
+    }
+
+
+# ─────────────────────────────────────────
+# VERIFY EVENT — GET /v1/events/{event_id}/verify
+# ─────────────────────────────────────────
+
+@router.get("/{event_id}/verify")
+async def verify_event(
+    event_id: str,
+    tenant: dict = Depends(get_tenant),
+):
+    try:
+        event_uuid = UUID(event_id)
+    except ValueError:
+        raise not_found("Event not found")
+    # A key not yet bound to an agent must not read tenant-wide rows, and
+    # asserting on the row's agent would bind the key to whichever agent owns
+    # the event it guessed. It can verify per agent via /verify?agent=.
+    if is_unbound_api_key(tenant):
+        raise not_found("Event not found")
+
+    pool = get_pool()
+    # A scoped agent key cannot see other agents' events.
+    scoped_agent = tenant.get("agent_id")
+    row = await pool.fetchrow(
+        f"""
+        SELECT {CHECKSUM_COLUMNS}
+        FROM events
+        WHERE event_id = $1 AND tenant_id = $2
+          AND ($3::text IS NULL OR agent_id = $3)
+        """,
+        event_uuid, tenant["tenant_id"], scoped_agent,
+    )
+    if row is None:
+        raise not_found("Event not found")
+
+    await assert_agent_allowed(tenant, row["agent_id"])
+
+    result = verify_stored_checksum(row, await fetch_legacy_cutoff(pool))
+    return {"event_id": str(row["event_id"]), "agent": row["agent_id"], **result}
 
 
 # ─────────────────────────────────────────

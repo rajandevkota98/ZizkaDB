@@ -102,7 +102,7 @@ cd dashboard && npm run lint && npm test && npm run build
 **Auth split** — Two FastAPI dependency functions:
 - `get_tenant` (`core/api/deps.py`): accepts API keys + JWTs. Use for SDK-callable routes (`/v1/events`, `/v1/search`, `/v1/memory`, etc.)
 - `require_dashboard_session` (`core/api/deps.py`): JWT only, rejects API keys. Use for any route that accesses `user_id`, manages API keys, or performs destructive ops. (There is no admin router / `require_admin` in this codebase.)
-- `assert_agent_allowed(tenant, agent_id)` (`core/api/deps.py`): call at the top of any per-agent analytics route AND any SDK read scoped to one agent (`memory/context`, `memory/diff`, `events/why`) to enforce scoped-key isolation.
+- `assert_agent_allowed(tenant, agent_id)` (`core/api/deps.py`): call at the top of any per-agent analytics route AND any SDK read scoped to one agent (`memory/context`, `memory/diff`, `events/why`, `events/impact`) to enforce scoped-key isolation.
 
 **Billing stub** — `billing_status_payload()` always returns `has_access: True`. No Stripe or payment provider is wired. The architecture is ready for Stripe to be added; billing routes exist but are stubs.
 
@@ -112,7 +112,7 @@ cd dashboard && npm run lint && npm test && npm run build
 
 **Schema migrations** — Fresh install: `core/db/schema.sql` (run by Docker on first boot). Running install: `ALTER TABLE IF EXISTS` in `core/db/connection.py::init_db()` (runs on every startup). Always write idempotent DDL.
 
-**Entitlements** — `PLAN_ENTITLEMENTS` dict in `core/services/entitlements.py` is the single source of truth for per-plan API key caps. Override per-plan at runtime with `API_KEY_LIMIT_<PLAN>=N` env var. Never hardcode plan limits anywhere else.
+**Entitlements** — `PLAN_ENTITLEMENTS` dict in `core/services/entitlements.py` is the single source of truth for per-plan caps (API keys and agents). **Self-hosted is one agent with one API key**, always enforced (`limits_enforced()` is true whenever `DEPLOYMENT_MODE=self_hosted`) and not overridable by env. The agent cap is applied in `core/services/agent_limits.py` on every path that can create an agent (dashboard create, first event for a new agent name, key binding); existing agents are never blocked. Multi-agent features (fleets, A2A) are ZizkaDB Cloud only — never add multi-agent capability to self-hosted. Managed plans can be tuned with `API_KEY_LIMIT_<PLAN>` / `MAX_AGENTS_<PLAN>`. Never hardcode plan limits anywhere else.
 
 ---
 
@@ -143,11 +143,11 @@ cd dashboard && npm run lint && npm test && npm run build
 
 1. **Auth deps**: never put `require_dashboard_session` routes on `get_tenant` — API-key holders must not be able to manage keys or access user data.
 2. **Route paths**: never rename `/v1/...` paths without updating `dashboard/lib/api.ts` — there is no runtime contract enforcement between backend and dashboard.
-3. **`assert_agent_allowed()`**: every per-agent analytics route and scoped SDK read (`agent_stats`, `list_sessions`, `agent_baseline`, `agent_behavior_change`, `time_travel`, `report`, `token-usage`, `token-optimization`, `suggestions`, `memory/context`, `memory/diff`, `events/why`) must call this.
+3. **`assert_agent_allowed()`**: every per-agent analytics route and scoped SDK read (`agent_stats`, `list_sessions`, `agent_baseline`, `agent_behavior_change`, `time_travel`, `report`, `token-usage`, `token-optimization`, `suggestions`, `memory/context`, `memory/diff`, `events/why`, `events/impact`) must call this.
 4. **Entitlements single source**: plan caps live only in `core/services/entitlements.py::PLAN_ENTITLEMENTS`.
 5. **Idempotent DDL**: all schema changes must use `IF NOT EXISTS` / `IF EXISTS` — the same migration runs on fresh installs and live databases.
 6. **`docker-compose.yml` is production**: never add `--reload` or `../core:/app` volume mounts to the base compose file. Those belong in `docker-compose.dev.yml`.
-7. **Self-hosted security**: always set `ENV=production` in production `.env` — without it, hardcoded dev API keys (`zizkadb_dev_local`) are accepted, bypassing auth entirely.
+7. **Self-hosted security**: development mode is opt-in. Only `ENV=development` enables the hardcoded dev API keys (`zizkadb_dev_local`), `/v1/auth/dev-token` and one-click sign-in; an unset or misspelt `ENV` is production (`core/services/runtime_env.py`). Never set `ENV=development` on a reachable deployment, and gate any new dev-only behaviour on `is_dev_mode()`, never on a raw `os.getenv("ENV")` comparison.
 8. **`NEXT_PUBLIC_DEV_MODE`**: must be `false` in any public-facing deployment — when `true`, the dashboard login screen is bypassed entirely (no OTP required).
 
 ---

@@ -15,10 +15,14 @@ Drift detection · MCP server · Python & TypeScript SDKs · Self-host or cloud
 
 [![CI](https://github.com/Zizka-ai/ZizkaDB/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Zizka-ai/ZizkaDB/actions/workflows/ci.yml)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
-[![Release](https://img.shields.io/badge/release-v0.2.8-f97316)](https://github.com/Zizka-ai/ZizkaDB/releases)
+[![Release](https://img.shields.io/badge/release-v0.3.0-f97316)](https://github.com/Zizka-ai/ZizkaDB/releases)
 [![Python SDK](https://img.shields.io/pypi/v/zizkadb-sdk?label=Python%20SDK)](https://pypi.org/project/zizkadb-sdk/)
 [![TypeScript SDK](https://img.shields.io/npm/v/zizkadb-sdk?label=TypeScript%20SDK)](https://www.npmjs.com/package/zizkadb-sdk)
 [![GitHub stars](https://img.shields.io/github/stars/Zizka-ai/ZizkaDB?style=flat)](https://github.com/Zizka-ai/ZizkaDB/stargazers)
+[![PyPI downloads](https://img.shields.io/pepy/dt/zizkadb-sdk?label=PyPI%20downloads)](https://pepy.tech/projects/zizkadb-sdk)
+[![npm downloads](https://img.shields.io/npm/d18m/zizkadb-sdk?label=npm%20downloads)](https://www.npmjs.com/package/zizkadb-sdk)
+
+<a href="https://postyourstartup.co/startup/zizkadb-1?ref=award" target="_blank"><img src="https://postyourstartup.co/api/badge/zizkadb-1/award?theme=light&week=32" alt="#1 Product of the Week on PostYourStartup" width="212" height="55" /></a>
 
 </div>
 
@@ -28,7 +32,7 @@ Every agent team eventually asks: *Why did it say that? Why did it call that too
 - **Time-travel.** `db.at(agent, timestamp)` rebuilds exactly what the agent knew at any past moment.
 - **Tamper-evident audit trail.** Every decision is logged with a checksum, so you have a verifiable record for EU AI Act Article 12.
 - **Drift detection.** See when an agent's behavior shifts from its baseline.
-- **Self-host or cloud.** Run it on your own Postgres with one Docker command, or use [ZizkaDB Cloud](https://db.zizka.ai). AGPL-3.0, no per-trace billing; self-hosted data never leaves your infrastructure.
+- **Self-host or cloud.** Run it on your own Postgres with one Docker command, or use [ZizkaDB Cloud](https://db.zizka.ai). AGPL-3.0, no per-trace billing; self-hosted data never leaves your infrastructure. Self-hosted runs **one agent with one API key**; multiple agents, agent fleets and agent-to-agent messaging are on Cloud.
 
 <p align="center">
   <a href="#quickstart-60-seconds"><img src="docs/assets/why-chain.svg" alt="Animated: db.why() walks from a tool_call back through llm_response to the root-cause user_message" width="900"/></a>
@@ -51,21 +55,21 @@ Every agent team eventually asks: *Why did it say that? Why did it call that too
 
 ## Quickstart (60 seconds)
 
-From zero to your first causal chain with one command. No repo clone needed.
+One command, one container. No repo clone, no Python, no config files.
 
 <p align="center">
-  <a href="scripts/quickstart-remote.sh"><img src="docs/assets/quickstart-terminal.svg" alt="Terminal animation: one curl command downloads config, pulls images, starts the stack, installs the SDK and prints a causal chain" width="900"/></a>
+  <a href="scripts/quickstart-remote.sh"><img src="docs/assets/quickstart-terminal.svg" alt="Terminal animation: one curl command starts ZizkaDB and prints a causal chain" width="900"/></a>
 </p>
 
-**1. Start Docker.** [Docker](https://docs.docker.com/get-docker/) must be running. The first image pull can take 5–10 minutes; later starts take seconds.
-
-**2. Install and run.** This downloads config and pre-built images, starts Postgres, Qdrant, Redis, the API and the dashboard, then runs a demo agent:
+**1. Run it.** With [Docker](https://docs.docker.com/get-docker/) running:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Zizka-ai/ZizkaDB/main/scripts/quickstart-remote.sh | bash
 ```
 
-**3. See why.** The demo prints the causal chain behind the agent's tool call:
+This pulls a single image (Postgres, the API and the dashboard together), starts it, and logs a demo agent run. After the download, startup takes a few seconds.
+
+**2. See why.** It prints the causal chain behind the demo agent's tool call:
 
 ```text
 tool_call · lookup_order · ORD-8842
@@ -73,13 +77,39 @@ tool_call · lookup_order · ORD-8842
         └── user_message · Why was my order delayed?
 ```
 
-**4. Open the dashboard.** [localhost:3001](http://localhost:3001) → **Open my dashboard** → Activity → click any event → **Why? (causal)** tab.
+**3. Explore.** The dashboard opens on that agent, already signed in: [localhost:3001/dashboard/activity?agent=support-bot](http://localhost:3001/dashboard/activity?agent=support-bot). Click any event → **Why? (causal)** tab.
+
+Now log your own agent: `pip install zizkadb-sdk`, then see [CONNECT.md](CONNECT.md). The local API is `http://localhost:8000` with key `zizkadb_dev_local`.
+
+<details>
+<summary>Prefer plain <code>docker run</code>? Day-two commands</summary>
+
+The script is a wrapper around this:
+
+```bash
+docker run -d --name zizkadb -p 127.0.0.1:8000:8000 -p 127.0.0.1:3001:3001 \
+  -v zizkadb_data:/data ghcr.io/zizka-ai-sl/zizkadb
+```
+
+| Do this | Command |
+|---------|---------|
+| Stop / start | `docker stop zizkadb` / `docker start zizkadb` |
+| Logs | `docker logs -f zizkadb` |
+| Upgrade (keeps data) | re-run the quickstart command |
+| Erase everything | `docker rm -f zizkadb && docker volume rm zizkadb_data` |
+| Dashboard port busy | `ZIZKADB_DASHBOARD_PORT=3005` before the quickstart command |
+
+</details>
+
+The single container is for your own machine: it keeps the ports on `127.0.0.1`, signs you in with one click and accepts a well-known API key. It runs without Qdrant, so semantic search and embeddings need the full stack below. For a server other people can reach, use [Self-host on a server](#self-host-on-a-server).
 
 The self-hosted dashboard is just your dashboard: no signup, no email, no account. Accounts and plans exist only on [ZizkaDB Cloud](https://db.zizka.ai).
 
-Run the demo again anytime: `pip install zizkadb-sdk && zizkadb demo`
+Self-hosted is single-agent: the first agent name you log with becomes your agent, and a second name is rejected with a message naming it. The `support-bot` demo agent does not count. For several agents, use [ZizkaDB Cloud](https://db.zizka.ai).
 
 ### Self-host from a clone
+
+The full stack (Postgres, Qdrant, Redis, API, dashboard as separate containers) — use this for development, semantic search, or production:
 
 ```bash
 git clone https://github.com/Zizka-ai/ZizkaDB.git && cd ZizkaDB
@@ -89,7 +119,7 @@ bash scripts/setup-local.sh
 | Service | URL |
 |---------|-----|
 | API | http://localhost:8000 |
-| Dashboard | http://localhost:3001 → **Open my dashboard** |
+| Dashboard | http://localhost:3001 |
 | Swagger | http://localhost:8000/swagger |
 
 ### Self-host on a server
@@ -210,7 +240,7 @@ From the terminal: `zizkadb why <event_id>`. Full guide: **[CONNECT.md](CONNECT.
 
 Article 12 of the EU AI Act requires high-risk AI systems to automatically keep logs of what they did. ZizkaDB gives you that record:
 
-- **Checksum-backed decision logs.** Every event is stored with a SHA-256 checksum of its content, so any later edit is detectable.
+- **Checksum-backed decision logs.** Every event is stored with a SHA-256 checksum over its content and audit fields (agent, session, parent, timestamp, sequence), and `GET /v1/events/verify` reports any row whose fields no longer match.
 - **Causally linked history.** Each decision points to the event that caused it, so an auditor can follow the full chain.
 - **Session replay.** Step through any past session event by event.
 - **Time-travel debugging.** Rebuild exactly what the agent knew at any moment with `db.at()`.
@@ -329,32 +359,43 @@ The stack isn't running. Start it with the curl command above or `bash scripts/s
 
 Thanks to everyone who has helped build ZizkaDB. Want to join? Read [CONTRIBUTING.md](CONTRIBUTING.md) or pick up an [open issue](https://github.com/Zizka-ai/ZizkaDB/issues).
 
+<!-- CONTRIBUTORS:START -->
 <table>
   <tr>
     <td align="center" width="25%"><a href="https://github.com/saadamjad"><img src="https://github.com/saadamjad.png?size=120" width="64" alt="saadamjad"/><br/><sub>saadamjad</sub></a></td>
     <td align="center" width="25%"><a href="https://github.com/Zizka-ai"><img src="https://github.com/Zizka-ai.png?size=120" width="64" alt="Zizka-ai"/><br/><sub>Zizka-ai</sub></a></td>
     <td align="center" width="25%"><a href="https://github.com/arshadgit23"><img src="https://github.com/arshadgit23.png?size=120" width="64" alt="arshadgit23"/><br/><sub>arshadgit23</sub></a></td>
-    <td align="center" width="25%"><a href="https://github.com/saadwashmen"><img src="https://github.com/saadwashmen.png?size=120" width="64" alt="saadwashmen"/><br/><sub>saadwashmen</sub></a></td>
+    <td align="center" width="25%"><a href="https://github.com/Subhajitdas99"><img src="https://github.com/Subhajitdas99.png?size=120" width="64" alt="Subhajitdas99"/><br/><sub>Subhajitdas99</sub></a></td>
   </tr>
   <tr>
-    <td align="center" width="25%"><a href="https://github.com/Subhajitdas99"><img src="https://github.com/Subhajitdas99.png?size=120" width="64" alt="Subhajitdas99"/><br/><sub>Subhajitdas99</sub></a></td>
+    <td align="center" width="25%"><a href="https://github.com/saadwashmen"><img src="https://github.com/saadwashmen.png?size=120" width="64" alt="saadwashmen"/><br/><sub>saadwashmen</sub></a></td>
     <td align="center" width="25%"><a href="https://github.com/mikeaig4real"><img src="https://github.com/mikeaig4real.png?size=120" width="64" alt="mikeaig4real"/><br/><sub>mikeaig4real</sub></a></td>
     <td align="center" width="25%"><a href="https://github.com/aqilaziz"><img src="https://github.com/aqilaziz.png?size=120" width="64" alt="aqilaziz"/><br/><sub>aqilaziz</sub></a></td>
-    <td align="center" width="25%"><a href="https://github.com/lamenting-hawthorn"><img src="https://github.com/lamenting-hawthorn.png?size=120" width="64" alt="lamenting-hawthorn"/><br/><sub>lamenting-hawthorn</sub></a></td>
+    <td align="center" width="25%"><a href="https://github.com/pingkui"><img src="https://github.com/pingkui.png?size=120" width="64" alt="pingkui"/><br/><sub>pingkui</sub></a></td>
   </tr>
   <tr>
+    <td align="center" width="25%"><a href="https://github.com/AIandI0x1"><img src="https://github.com/AIandI0x1.png?size=120" width="64" alt="AIandI0x1"/><br/><sub>AIandI0x1</sub></a></td>
+    <td align="center" width="25%"><a href="https://github.com/lamenting-hawthorn"><img src="https://github.com/lamenting-hawthorn.png?size=120" width="64" alt="lamenting-hawthorn"/><br/><sub>lamenting-hawthorn</sub></a></td>
+    <td align="center" width="25%"><a href="https://github.com/nabeeltahirdeveloper"><img src="https://github.com/nabeeltahirdeveloper.png?size=120" width="64" alt="nabeeltahirdeveloper"/><br/><sub>nabeeltahirdeveloper</sub></a></td>
     <td align="center" width="25%"><a href="https://github.com/abdurrehman616"><img src="https://github.com/abdurrehman616.png?size=120" width="64" alt="abdurrehman616"/><br/><sub>abdurrehman616</sub></a></td>
-    <td align="center" width="25%"><a href="https://github.com/HafizHamzaShahid"><img src="https://github.com/HafizHamzaShahid.png?size=120" width="64" alt="HafizHamzaShahid"/><br/><sub>HafizHamzaShahid</sub></a></td>
+  </tr>
+  <tr>
+    <td align="center" width="25%"><a href="https://github.com/danielhagever"><img src="https://github.com/danielhagever.png?size=120" width="64" alt="danielhagever"/><br/><sub>danielhagever</sub></a></td>
     <td align="center" width="25%"><a href="https://github.com/eaz1337"><img src="https://github.com/eaz1337.png?size=120" width="64" alt="eaz1337"/><br/><sub>eaz1337</sub></a></td>
+    <td align="center" width="25%"><a href="https://github.com/HafizHamzaShahid"><img src="https://github.com/HafizHamzaShahid.png?size=120" width="64" alt="HafizHamzaShahid"/><br/><sub>HafizHamzaShahid</sub></a></td>
     <td align="center" width="25%"><a href="https://github.com/mbilalzeeshan"><img src="https://github.com/mbilalzeeshan.png?size=120" width="64" alt="mbilalzeeshan"/><br/><sub>mbilalzeeshan</sub></a></td>
   </tr>
   <tr>
+    <td align="center" width="25%"><a href="https://github.com/nabeeltahirpsy"><img src="https://github.com/nabeeltahirpsy.png?size=120" width="64" alt="nabeeltahirpsy"/><br/><sub>nabeeltahirpsy</sub></a></td>
     <td align="center" width="25%"><a href="https://github.com/AbdelazizBs"><img src="https://github.com/AbdelazizBs.png?size=120" width="64" alt="AbdelazizBs"/><br/><sub>AbdelazizBs</sub></a></td>
     <td align="center" width="25%"><a href="https://github.com/Mephistopheles9631"><img src="https://github.com/Mephistopheles9631.png?size=120" width="64" alt="Mephistopheles9631"/><br/><sub>Mephistopheles9631</sub></a></td>
     <td align="center" width="25%"><a href="https://github.com/Qalbeabbas-12"><img src="https://github.com/Qalbeabbas-12.png?size=120" width="64" alt="Qalbeabbas-12"/><br/><sub>Qalbeabbas-12</sub></a></td>
+  </tr>
+  <tr>
     <td align="center" width="25%"><a href="https://github.com/towfiq-ul"><img src="https://github.com/towfiq-ul.png?size=120" width="64" alt="towfiq-ul"/><br/><sub>towfiq-ul</sub></a></td>
   </tr>
 </table>
+<!-- CONTRIBUTORS:END -->
 
 ---
 

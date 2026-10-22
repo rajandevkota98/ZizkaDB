@@ -123,6 +123,8 @@ async def init_db():
         ALTER TABLE users ADD COLUMN IF NOT EXISTS gdpr_consent_at TIMESTAMPTZ;
         ALTER TABLE users ADD COLUMN IF NOT EXISTS marketing_consent BOOLEAN NOT NULL DEFAULT FALSE;
         ALTER TABLE users ADD COLUMN IF NOT EXISTS marketing_consent_at TIMESTAMPTZ;
+
+        ALTER TABLE auth_otps ADD COLUMN IF NOT EXISTS attempts INT NOT NULL DEFAULT 0;
     """)
 
     await _pg_pool.execute("""
@@ -211,6 +213,31 @@ async def init_db():
         CREATE INDEX IF NOT EXISTS idx_events_index_status
         ON events (index_status)
         WHERE index_status IN ('pending', 'failed');
+    """)
+
+    # Event checksum v2 (services/checksum.py). The first start on v2 code
+    # records the newest event that may still carry a v1 checksum; v1 is never
+    # accepted above it, so a v2 row cannot be downgraded. Later starts keep
+    # the original value (ON CONFLICT DO NOTHING).
+    await _pg_pool.execute("""
+        CREATE TABLE IF NOT EXISTS checksum_v2_cutoff (
+            singleton        BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+            legacy_until_seq BIGINT NOT NULL,
+            recorded_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        INSERT INTO checksum_v2_cutoff (legacy_until_seq)
+        SELECT COALESCE(MAX(sequence_no), 0) FROM events
+        ON CONFLICT (singleton) DO NOTHING;
+        CREATE INDEX IF NOT EXISTS idx_events_agent_seq
+        ON events (tenant_id, agent_id, sequence_no DESC);
+    """)
+
+    # Time travel reads only an agent's state writes; without this index, finding them can
+    # mean scanning every event in the table.
+    await _pg_pool.execute("""
+        CREATE INDEX IF NOT EXISTS idx_events_state_writes
+        ON events (tenant_id, agent_id, timestamp)
+        WHERE event_type IN ('STATE_SET', 'STATE_DELETE');
     """)
 
     await _pg_pool.execute("""
@@ -388,11 +415,24 @@ async def init_db():
 
     # ---------------- Qdrant ----------------
 
+    qdrant_url = os.getenv("QDRANT_URL", "http://localhost:6333").strip()
+
+    from services.entitlements import embeddings_enabled
+
+    # QDRANT_URL="" opts out of Qdrant entirely (single-container quickstart).
+    # Only honoured with embeddings off, where nothing reads or writes vectors.
+    if not qdrant_url:
+        if embeddings_enabled():
+            raise RuntimeError(
+                "QDRANT_URL is empty but embeddings are enabled. "
+                "Set QDRANT_URL, or set EMBEDDINGS_ENABLED=false."
+            )
+        _qdrant = None
+        logger.info("Qdrant disabled (QDRANT_URL empty, embeddings off)")
+        return
+
     _qdrant = AsyncQdrantClient(
-        url=os.getenv(
-            "QDRANT_URL",
-            "http://localhost:6333",
-        ),
+        url=qdrant_url,
         timeout=30,
         check_compatibility=False,
     )

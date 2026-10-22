@@ -9,7 +9,7 @@ replacement for LLM-provided memory:
 
 from fastapi import APIRouter, Depends
 from services.exceptions import bad_request, not_found, service_unavailable
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Any
 import asyncio
 import hashlib
@@ -32,10 +32,13 @@ log = logging.getLogger(__name__)
 class ContextRequest(BaseModel):
     agent: str
     task: str
-    max_tokens: int = 2000
+    # Bounds mirror SearchRequest / the list routes: a negative recent_limit
+    # reached Postgres as LIMIT $4 and errored (500), and unbounded limits
+    # allowed an arbitrarily large events / vector fetch.
+    max_tokens: int = Field(default=2000, ge=1)
     session_id: str | None = None   # exclude current session from context
-    recent_limit: int = 10          # how many recent events to always include
-    semantic_limit: int = 10        # how many semantically relevant events
+    recent_limit: int = Field(default=10, ge=1, le=100)   # recent events to always include
+    semantic_limit: int = Field(default=10, ge=1, le=100) # semantically relevant events
 
 
 class ForgetRequest(BaseModel):
@@ -223,25 +226,33 @@ async def session_diff(
         print(diff["summary"])
         print(diff["new_patterns"])
     """
+    if is_unbound_api_key(tenant):
+        raise bad_request(
+            "diff requires an agent-scoped API key: log an event with this key "
+            "first, or use the dashboard for tenant-wide session diffs."
+        )
+
     tenant_id = tenant["tenant_id"]
     pool = get_pool()
 
-    # Events in this session
+    scoped_agent = tenant.get("agent_id")
+
+    # Events in this session; a scoped key only ever sees its own agent's rows.
     rows = await pool.fetch(
         """
         SELECT event_id, agent_id, event_type, data, timestamp, parent_event_id
         FROM events
         WHERE tenant_id = $1 AND session_id = $2
+          AND ($3::text IS NULL OR agent_id = $3)
         ORDER BY timestamp ASC
         """,
-        tenant_id, session_id,
+        tenant_id, session_id, scoped_agent,
     )
 
     if not rows:
         raise not_found("Session not found")
 
-    agent_id = rows[0]["agent_id"]
-    # A scoped agent key may only diff sessions belonging to its own agent.
+    agent_id = scoped_agent or rows[0]["agent_id"]
     await assert_agent_allowed(tenant, agent_id)
     events = []
     event_types: dict[str, int] = {}
@@ -349,54 +360,71 @@ async def forget(
     # constraining the SELECT is sufficient.
     scoped_agent = tenant.get("agent_id")
 
-    # Find matching event IDs
-    rows = await pool.fetch(
-        """
-        SELECT event_id
-        FROM events
-        WHERE tenant_id = $1
-          AND data->$2 = to_jsonb($3::text)
-          AND ($4::text IS NULL OR agent_id = $4)
-        """,
-        tenant_id,
-        body.filter_key,
-        body.filter_value,
-        scoped_agent,
-    )
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            # Find matching event IDs
+            rows = await conn.fetch(
+                """
+                SELECT event_id
+                FROM events
+                WHERE tenant_id = $1
+                  AND data->$2 = to_jsonb($3::text)
+                  AND ($4::text IS NULL OR agent_id = $4)
+                """,
+                tenant_id,
+                body.filter_key,
+                body.filter_value,
+                scoped_agent,
+            )
 
-    if not rows:
-        return {
-            "deleted_events": 0,
-            "filter": {
-                "key": body.filter_key,
-                "value": body.filter_value,
-            },
-            "message": "No matching events found",
-        }
+            if not rows:
+                return {
+                    "deleted_events": 0,
+                    "filter": {
+                        "key": body.filter_key,
+                        "value": body.filter_value,
+                    },
+                    "message": "No matching events found",
+                }
 
-    event_ids = [r["event_id"] for r in rows]
-    deleted = len(event_ids)
+            event_ids = [r["event_id"] for r in rows]
+            deleted = len(event_ids)
 
-    # Vectors first: if the search index can't be cleaned, keep the Postgres
-    # rows so a retry can still find (and delete) the vectors. Deleting a
-    # missing Qdrant point is a no-op, so retries are idempotent.
-    vector_cleanup = await _delete_vectors(event_ids, tenant_id)
-    if not vector_cleanup and embeddings_enabled():
-        raise service_unavailable(
-            "Search index unavailable; nothing was deleted. Retry forget shortly."
-        )
+            # Serialize against the embedding worker (#234): take the
+            # per-event advisory lock (the codebase's pattern, cf.
+            # services/api_keys) before deleting vectors and rows, so a
+            # worker that already selected one of these events cannot
+            # recreate its vector once the deletion commits. Locks are
+            # taken in sorted order so concurrent forgets cannot
+            # deadlock, and released when the transaction ends.
+            for eid in sorted(event_ids, key=str):
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext($1))", str(eid)
+                )
 
-    # PostgreSQL does not support aggregate functions in RETURNING clauses.
-    # We already know the count from the SELECT above, so use that directly.
-    await pool.execute(
-        """
-        DELETE FROM events
-        WHERE tenant_id = $1
-          AND event_id = ANY($2::uuid[])
-        """,
-        tenant_id,
-        event_ids,
-    )
+            # Vectors first: if the search index can't be cleaned, keep
+            # the Postgres rows so a retry can still find (and delete)
+            # the vectors. Deleting a missing Qdrant point is a no-op,
+            # so retries are idempotent. Raising here rolls the
+            # transaction back, so nothing is deleted.
+            vector_cleanup = await _delete_vectors(event_ids, tenant_id)
+            if not vector_cleanup and embeddings_enabled():
+                raise service_unavailable(
+                    "Search index unavailable; nothing was deleted. Retry forget shortly."
+                )
+
+            # PostgreSQL does not support aggregate functions in RETURNING
+            # clauses. We already know the count from the SELECT above, so
+            # use that directly.
+            await conn.execute(
+                """
+                DELETE FROM events
+                WHERE tenant_id = $1
+                  AND event_id = ANY($2::uuid[])
+                """,
+                tenant_id,
+                event_ids,
+            )
 
     # Never log the forgotten value itself (it is usually personal data).
     log.info(

@@ -11,6 +11,7 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timedelta, timezone
 from db.connection import get_pool
+from services.runtime_env import is_dev_mode
 
 log = logging.getLogger(__name__)
 
@@ -28,11 +29,12 @@ def _required_secret(env_var: str, dev_fallback: str) -> str:
     secret = os.getenv(env_var)
     if secret:
         return secret
-    if os.getenv("ENV", "development") != "development":
+    if not is_dev_mode():
         raise RuntimeError(
             f"{env_var} must be set in production. Refusing to sign tokens "
             f"with the hardcoded development fallback, since that value is "
-            f"visible in the public source code."
+            f"visible in the public source code. For local development set "
+            f"ENV=development."
         )
     return dev_fallback
 
@@ -180,6 +182,9 @@ _SIGNUP_ALREADY_REGISTERED = (
 )
 _SIGNUP_GDPR_REQUIRED = "GDPR consent is required to create an account."
 
+# Wrong guesses allowed per OTP before it is burned.
+OTP_MAX_ATTEMPTS = 5
+
 
 async def verify_otp(
     email: str,
@@ -206,6 +211,21 @@ async def verify_otp(
 
     valid = bcrypt.checkpw(otp.encode(), row["otp_hash"].encode())
     if not valid:
+        # Single atomic increment: concurrent wrong guesses serialise on the
+        # row lock, so the lockout holds against a parallel brute force.
+        counted = await pool.fetchrow(
+            """
+            UPDATE auth_otps
+               SET attempts = attempts + 1,
+                   used     = (attempts + 1 >= $2)
+             WHERE otp_id = $1 AND used = FALSE
+            RETURNING attempts, used
+            """,
+            row["otp_id"], OTP_MAX_ATTEMPTS,
+        )
+        # No row: a concurrent request already burned (or consumed) the code.
+        if counted is None or counted["used"]:
+            raise ValueError("Too many failed attempts. Please request a new code.")
         raise ValueError("Invalid OTP")
 
     user_exists = await email_exists(email)

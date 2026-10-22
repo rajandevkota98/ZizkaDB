@@ -1,6 +1,6 @@
 # zizkadb-sdk
 
-**PyPI:** [zizkadb-sdk 0.2.8](https://pypi.org/project/zizkadb-sdk/0.2.8/)
+**PyPI:** [zizkadb-sdk 0.3.0](https://pypi.org/project/zizkadb-sdk/0.3.0/)
 
 Python SDK for [ZizkaDB](https://github.com/Zizka-ai/ZizkaDB) — **Why did your agent do that?** Call `db.why(event_id)` or `zizkadb why <id>` after logging with `parent_id`.
 
@@ -61,9 +61,11 @@ async with db:
     chain.print()
 ```
 
-## Multi-agent apps (one key, many agent names)
+## Multi-agent apps (ZizkaDB Cloud)
 
-If your app logs to **different agent ids** per user (e.g. `conv-alice`, `conv-bob`), create a **tenant-wide key** in **Settings → Tenant-wide API key**. Per-agent keys only work for that one agent name.
+An API key works for one agent name. Running several agents — and agent-to-agent messaging between them — is a [ZizkaDB Cloud](https://db.zizka.ai) feature; create each agent and its key in the dashboard.
+
+Self-hosted ZizkaDB is single-agent: log everything under one agent name and use `session_id` to separate users or conversations. A second agent name is rejected with `409 agent_limit_reached`.
 
 ## Errors
 

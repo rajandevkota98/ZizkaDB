@@ -169,6 +169,17 @@ export interface AgentEvent {
   index_status?: 'pending' | 'indexed' | 'failed' | 'skipped'
 }
 
+/** One tool or API an agent called, with its call count and error rate. */
+export interface AgentAction {
+  kind: 'tool' | 'api'
+  name: string
+  calls: number
+  errors: number
+  error_rate_pct: number
+  /** Share of all named tool/API calls in scope. */
+  share_pct: number
+}
+
 export interface AgentStats {
   total_events: number
   unique_event_types: number
@@ -176,6 +187,7 @@ export interface AgentStats {
   first_event: string | null
   last_event: string | null
   top_events: { event: string; count: number }[]
+  top_actions?: AgentAction[]
 }
 
 export interface WhyChain {
@@ -186,6 +198,18 @@ export interface WhyChain {
   event_id: string
   chain_length: number
   chain: AgentEvent[]
+}
+
+export interface ImpactNode extends AgentEvent {
+  depth: number
+}
+
+export interface ImpactTree {
+  event_id: string
+  node_count: number
+  truncated: boolean
+  depth_truncated: boolean
+  nodes: ImpactNode[]
 }
 
 export interface AgentSession {
@@ -230,6 +254,16 @@ export async function getEvents(
 
 export async function getWhyChain(token: string, eventId: string): Promise<WhyChain> {
   return apiFetch(`/v1/events/${eventId}/why`, token)
+}
+
+// Downstream mirror of getWhyChain: everything an event caused.
+export async function getImpactTree(
+  token: string,
+  eventId: string,
+  depth?: number,
+): Promise<ImpactTree> {
+  const qs = depth !== undefined ? `?depth=${depth}` : ''
+  return apiFetch(`/v1/events/${eventId}/impact${qs}`, token)
 }
 
 export async function getTenantSessions(
@@ -333,6 +367,8 @@ export interface BaselineWindow {
   avg_events_per_session: number
   avg_session_seconds: number
   error_rate_pct: number
+  actions?: AgentAction[]
+  action_distribution?: Record<string, number>
 }
 
 export interface BaselineChange {
@@ -444,6 +480,7 @@ export interface ReportPayload {
     event_distribution: Record<string, number>
     transitions: Record<string, number>
   }
+  actions?: AgentAction[]
   sessions: ReportSession[]
   drift: ReportDrift | null
   recommendations: ReportRecommendation[]

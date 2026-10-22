@@ -1,6 +1,6 @@
 # Connect your agent (self-host / OSS)
 
-**Current PyPI releases:** `zizkadb-sdk` **0.2.8** · `zizkadb-mcp` **0.1.7** · `zizkadb-langchain` **0.1.3** · `zizkadb-crewai` **0.1.3** · `zizkadb-livekit` **0.2.0**
+**Current PyPI releases:** `zizkadb-sdk` **0.3.0** · `zizkadb-mcp` **0.1.8** · `zizkadb-langchain` **0.1.3** · `zizkadb-crewai` **0.1.3** · `zizkadb-livekit` **0.2.1**
 
 ## Start the stack (pick one)
 
@@ -28,7 +28,7 @@ Pick your stack below. Use the **same agent name** in code and dashboard.
 ## Python SDK
 
 ```bash
-pip install "zizkadb-sdk>=0.2.8"
+pip install "zizkadb-sdk>=0.3.0"
 ```
 
 ```python
@@ -62,6 +62,39 @@ export ZIZKADB_AGENT=my-bot
 
 ---
 
+## Name your tools and API calls
+
+An event type like `tool_call` says *that* a tool ran. Name it and the dashboard, reports and drift detection show *which* one: `tool_call · lookup_order`, calls and error rate per tool, and "refund calls up 12pp" instead of "tool calls up".
+
+```python
+call = await db.log_tool("support-bot", "lookup_order", args={"order_id": "ORD-8842"})
+await db.log_tool_result("support-bot", "lookup_order", result=order, parent_id=call.event_id)
+# on failure: await db.log_tool_result("support-bot", "lookup_order", error=exc, parent_id=call.event_id)
+
+await db.log_api("support-bot", "POST", "https://api.stripe.com/v1/refunds", status=200, duration_ms=312)
+```
+
+```typescript
+const call = await db.logTool({ agent: 'support-bot', tool: 'lookup_order', args: { orderId: 'ORD-8842' } })
+await db.logToolResult({ agent: 'support-bot', tool: 'lookup_order', result: order, parentId: call.eventId })
+
+await db.logApi({ agent: 'support-bot', method: 'POST', url: 'https://api.stripe.com/v1/refunds', status: 200 })
+```
+
+`log_api` drops the query string, fragment and credentials from the URL before logging, and names the call `POST api.stripe.com/v1/refunds` unless you pass `name`. A 4xx/5xx status or an `error` counts toward that API's error rate.
+
+Using plain `db.log()` or REST? Follow the same convention and you get the same views:
+
+| What | Event type | Payload keys |
+|------|-----------|--------------|
+| Tool call | `tool_call` | `data.tool` (name), `data.args` |
+| Tool outcome | `tool_result` / `tool_error` | `data.tool`, `data.result` or `data.error` |
+| API call | `api_call` | `data.api` (name) or `data.method` + `data.url`; `data.status` |
+
+The LangChain, LiveKit and MCP integrations already log tool names this way.
+
+---
+
 ## TypeScript SDK
 
 ```bash
@@ -91,7 +124,7 @@ await db.log({
 ## LangChain
 
 ```bash
-pip install "zizkadb-sdk>=0.2.8" "zizkadb-langchain>=0.1.3"
+pip install "zizkadb-sdk>=0.3.0" "zizkadb-langchain>=0.1.3"
 ```
 
 ```python
@@ -116,7 +149,7 @@ Or scaffold: `zizkadb init my-agent --template langchain`
 ## CrewAI
 
 ```bash
-pip install "zizkadb-sdk>=0.2.8" "zizkadb-crewai>=0.1.3"
+pip install "zizkadb-sdk>=0.3.0" "zizkadb-crewai>=0.1.3"
 ```
 
 ```python
@@ -140,7 +173,7 @@ Or scaffold: `zizkadb init my-agent --template crewai`
 One **LiveKit call** → one **ZizkaDB session** in Activity. Transcript text is copied from LiveKit at call end — **no audio** stored in ZizkaDB.
 
 ```bash
-pip install "zizkadb-livekit>=0.2.0"
+pip install "zizkadb-livekit>=0.2.1"
 ```
 
 ```python
@@ -190,7 +223,7 @@ Full sample: [examples/livekit-agent/](examples/livekit-agent/) (voice worker + 
 ## MCP (Cursor, Claude Desktop, Windsurf)
 
 ```bash
-pip install "zizkadb-mcp>=0.1.7"
+pip install "zizkadb-mcp>=0.1.8"
 # or: uvx zizkadb-mcp
 ```
 
